@@ -29,35 +29,33 @@ def _verify_init_data(init_data: str) -> dict:
     token = legacy.BOT_TOKEN
     if not token:
         raise RuntimeError("BOT_TOKEN is not configured on the API service")
-    if not init_data or len(init_data) > 16_384:
-        raise ValueError("Missing or invalid Telegram initData")
+    if not init_data:
+        raise ValueError("Missing Telegram initData")
 
-    # FIX: strict_parsing=False prevents crashes on trailing '&'
-    pairs = dict(parse_qsl(init_data, keep_blank_values=True, strict_parsing=False))
-    received_hash = pairs.pop("hash", None)
-    pairs.pop("signature", None)
-    
-    if not received_hash:
-        raise ValueError("Telegram initData has no hash")
+    try:
+        # This library handles all the URL decoding, sorting, and HMAC hashing automatically
+        # It returns the parsed data if valid, or raises a ValueError if invalid
+        parsed_data = validate_init_data(init_data, token)
+    except Exception as exc:
+        raise ValueError(f"Telegram initData signature verification failed: {exc}")
 
-    data_check_string = "\n".join(f"{key}={value}" for key, value in sorted(pairs.items()))
-    secret_key = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
-    calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-    
-    # FIX: Case-insensitive comparison
-    if not hmac.compare_digest(calculated_hash.lower(), received_hash.lower()):
-        raise ValueError("Telegram initData signature verification failed")
-
-    auth_date = int(pairs.get("auth_date", "0"))
     max_age = int(os.getenv("TELEGRAM_INITDATA_MAX_AGE", "86400"))
     now = int(time.time())
+    auth_date = int(parsed_data.get("auth_date", 0))
+    
     if auth_date <= 0 or auth_date > now + 60 or now - auth_date > max_age:
         raise ValueError("Telegram initData has expired")
 
-    user_raw = pairs.get("user")
+    user_raw = parsed_data.get("user")
     if not user_raw:
         raise ValueError("Telegram user information is missing")
-    user = json.loads(user_raw)
+    
+    # The library might return the user as a string or a dict depending on version
+    if isinstance(user_raw, str):
+        user = json.loads(user_raw)
+    else:
+        user = user_raw
+        
     user_id = int(user["id"])
     return {"user": user, "user_id": user_id, "auth_date": auth_date}
 
