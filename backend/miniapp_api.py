@@ -15,6 +15,8 @@ import logging
 import requests
 from functools import wraps
 from urllib.parse import parse_qsl
+from telegram_init_data import validate_init_data
+import json # Ensure this is imported, it probably already is
 
 from flask import Blueprint, current_app, jsonify, request
 
