@@ -574,3 +574,81 @@ def admin_order_decision(order_id: str):
     return jsonify({"ok": True, "order_id": order_id, "decision": decision,
                     "notification_status": notification_status,
                     "draw_at": legacy.to_iso(draw_at) if draw_at else None})
+    @miniapp_api.post("/telegram/webhook")
+def telegram_webhook():
+    update = request.get_json(silent=True) or {}
+    callback = update.get("callback_query")
+    if not callback:
+        return jsonify({"ok": True}), 200
+
+    callback_id = callback.get("id")
+    data = callback.get("data", "")
+    from_user_id = (callback.get("from") or {}).get("id")
+    message = callback.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+    original_caption = message.get("caption") or ""
+
+    if not (data.startswith("approve:") or data.startswith("reject:")):
+        if callback_id:
+            try:
+                _telegram_api("answerCallbackQuery", data={"callback_query_id": callback_id})
+            except Exception:
+                pass
+        return jsonify({"ok": True}), 200
+
+    if from_user_id != legacy.HOST_TELEGRAM_ID:
+        if callback_id:
+            try:
+                _telegram_api("answerCallbackQuery", data={
+                    "callback_query_id": callback_id,
+                    "text": "Only the authorized host can do this.",
+                    "show_alert": True,
+                })
+            except Exception:
+                pass
+        return jsonify({"ok": True}), 200
+
+    decision, order_id = data.split(":", 1)
+    order, status = legacy.process_order_decision(order_id, decision)
+
+    if status == "ok" and order:
+        badge = "✅ Payment approved." if decision == "approve" else "❌ Payment rejected."
+        alert_text = "Payment approved!" if decision == "approve" else "Payment rejected."
+        try:
+            _notify_customer_decision(order, decision)
+        except Exception:
+            logger.exception("Customer notification failed for order %s", order_id)
+        if decision == "approve":
+            try:
+                legacy.maybe_schedule_draw()
+            except Exception:
+                logger.exception("Draw scheduling check failed after approval")
+    elif status == "expired":
+        badge = "⌛ Order expired."
+        alert_text = "This order has already expired."
+    else:
+        badge = "⚠️ Already processed."
+        alert_text = "Order not found or already processed."
+
+    if chat_id and message_id:
+        try:
+            _telegram_api("editMessageCaption", data={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "caption": f"{original_caption}\n\n{badge}"[:1024],
+                "reply_markup": json.dumps({"inline_keyboard": []}),
+            })
+        except Exception:
+            logger.exception("Could not update support channel caption for order %s", order_id)
+
+    if callback_id:
+        try:
+            _telegram_api("answerCallbackQuery", data={
+                "callback_query_id": callback_id,
+                "text": alert_text,
+            })
+        except Exception:
+            pass
+
+    return jsonify({"ok": True}), 200
