@@ -30,16 +30,20 @@ def _verify_init_data(init_data: str) -> dict:
     if not init_data or len(init_data) > 16_384:
         raise ValueError("Missing or invalid Telegram initData")
 
-    pairs = dict(parse_qsl(init_data, keep_blank_values=True, strict_parsing=True))
+    # FIX: strict_parsing=False prevents crashes on trailing '&'
+    pairs = dict(parse_qsl(init_data, keep_blank_values=True, strict_parsing=False))
     received_hash = pairs.pop("hash", None)
     pairs.pop("signature", None)
+    
     if not received_hash:
         raise ValueError("Telegram initData has no hash")
 
     data_check_string = "\n".join(f"{key}={value}" for key, value in sorted(pairs.items()))
     secret_key = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
     calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(calculated_hash, received_hash):
+    
+    # FIX: Case-insensitive comparison
+    if not hmac.compare_digest(calculated_hash.lower(), received_hash.lower()):
         raise ValueError("Telegram initData signature verification failed")
 
     auth_date = int(pairs.get("auth_date", "0"))
@@ -88,7 +92,6 @@ def require_admin(fn):
             return jsonify({"error": "Administrator access required."}), 403
         return fn(*args, **kwargs)
     return wrapped
-
 
 
 logger = logging.getLogger("koshkosh-miniapp-api")
@@ -230,6 +233,7 @@ def _notify_customer_decision(order: dict, decision: str):
         message = labels["payment_rejected"]
     _telegram_api("sendMessage", data={"chat_id": order["user_id"], "text": message})
 
+
 def _cart_payload(user_id: int) -> dict | None:
     cart = legacy.get_cart(user_id)
     if not cart:
@@ -361,7 +365,6 @@ def history():
         "tickets": [ticket_row(row) for row in tickets],
         "wins": [dict(row) for row in wins],
     })
-
 
 
 @miniapp_api.post("/checkout/start")
