@@ -15,7 +15,7 @@ import logging
 import requests
 from functools import wraps
 from urllib.parse import parse_qsl
-from telegram_init_data import validate_init_data
+from telegram_init_data import validate, parse
 import json # Ensure this is imported, it probably already is
 
 from flask import Blueprint, current_app, jsonify, request
@@ -33,12 +33,15 @@ def _verify_init_data(init_data: str) -> dict:
         raise ValueError("Missing Telegram initData")
 
     try:
-        # This library handles all the URL decoding, sorting, and HMAC hashing automatically
-        # It returns the parsed data if valid, or raises a ValueError if invalid
-        parsed_data = validate_init_data(init_data, token)
+        # 1. Validate the signature (this raises an error if invalid)
+        validate(init_data, token)
+        
+        # 2. Parse the data to get the user info
+        parsed_data = parse(init_data)
     except Exception as exc:
         raise ValueError(f"Telegram initData signature verification failed: {exc}")
 
+    # Check expiration manually (since we removed the library's default check)
     max_age = int(os.getenv("TELEGRAM_INITDATA_MAX_AGE", "86400"))
     now = int(time.time())
     auth_date = int(parsed_data.get("auth_date", 0))
@@ -46,15 +49,9 @@ def _verify_init_data(init_data: str) -> dict:
     if auth_date <= 0 or auth_date > now + 60 or now - auth_date > max_age:
         raise ValueError("Telegram initData has expired")
 
-    user_raw = parsed_data.get("user")
-    if not user_raw:
+    user = parsed_data.get("user")
+    if not user:
         raise ValueError("Telegram user information is missing")
-    
-    # The library might return the user as a string or a dict depending on version
-    if isinstance(user_raw, str):
-        user = json.loads(user_raw)
-    else:
-        user = user_raw
         
     user_id = int(user["id"])
     return {"user": user, "user_id": user_id, "auth_date": auth_date}
