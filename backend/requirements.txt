@@ -1,0 +1,5 @@
+Flask>=3.0,<4
+psycopg[binary,pool]>=3.2,<4
+python-telegram-bot[job-queue]==22.6
+gunicorn>=22,<24
+requests>=2.31,<3
