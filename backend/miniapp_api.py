@@ -5,8 +5,6 @@ non-destructive miniapp_receipts table for private payment receipt metadata.
 """
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import os
 import time
@@ -14,7 +12,6 @@ import uuid
 import logging
 import requests
 from functools import wraps
-from urllib.parse import parse_qsl
 from telegram_init_data import validate, parse
 
 from flask import Blueprint, current_app, jsonify, request
@@ -224,6 +221,28 @@ def _notify_customer_decision(order: dict, decision: str):
     _telegram_api("sendMessage", data={"chat_id": order["user_id"], "text": message})
 
 
+def _notify_sold_out_via_api(draw_at):
+    round_id = legacy.get_current_round()
+    draw_time_str = legacy.format_ethiopia_time(draw_at)
+    msg_en = legacy.LANGUAGES["en"]["sold_out"].format(round_id=round_id, draw_time=draw_time_str)
+    try:
+        _telegram_api("sendMessage", data={"chat_id": legacy.SUPPORT_CHANNEL, "text": msg_en})
+    except Exception:
+        logger.exception("Could not send sold-out broadcast to support channel")
+
+    for row in legacy.get_all_user_ids():
+        uid = row["user_id"]
+        lang = legacy.get_language(uid)
+        msg_text = legacy.LANGUAGES.get(lang, legacy.LANGUAGES["en"])["sold_out"].format(
+            round_id=round_id,
+            draw_time=draw_time_str,
+        )
+        try:
+            _telegram_api("sendMessage", data={"chat_id": uid, "text": msg_text})
+        except Exception:
+            pass
+
+
 def _cart_payload(user_id: int) -> dict | None:
     cart = legacy.get_cart(user_id)
     if not cart:
@@ -239,6 +258,41 @@ def _cart_payload(user_id: int) -> dict | None:
     }
 
 
+def _draw_payload() -> dict:
+    draw_at = legacy.get_draw_time()
+    draw_completed = legacy.setting("draw_completed") == "1"
+    now = legacy.utc_now()
+    seconds_remaining = max(0, int((draw_at - now).total_seconds())) if draw_at else None
+
+    try:
+        wheel = legacy.get_wheel_snapshot()
+    except Exception:
+        wheel = {
+            "round_id": legacy.get_current_round(),
+            "status": "idle",
+            "active_rank": 0,
+            "revealed_count": 0,
+            "total_numbers": legacy.TOTAL_NUMBERS,
+            "results": [],
+        }
+
+    with legacy.db() as conn:
+        latest_results = conn.execute(
+            "SELECT prize_rank, round_id, prize_name, amount, number, drawn_at "
+            "FROM draw_results ORDER BY prize_rank"
+        ).fetchall()
+
+    return {
+        "draw_at": legacy.to_iso(draw_at) if draw_at else None,
+        "draw_at_ethiopia": legacy.format_ethiopia_time(draw_at) if draw_at else None,
+        "draw_completed": draw_completed,
+        "seconds_remaining": seconds_remaining,
+        "wheel_url": legacy.WHEEL_WEBAPP_URL or None,
+        "wheel": wheel,
+        "latest_results": [dict(r) for r in latest_results],
+    }
+
+
 def _receipt_table_exists(conn) -> bool:
     row = conn.execute("SELECT to_regclass('public.miniapp_receipts') AS table_name").fetchone()
     return bool(row and row["table_name"])
@@ -250,7 +304,7 @@ def bootstrap():
     user_id = request.telegram_user["user_id"]
     language = legacy.ensure_user(user_id)
     counts = legacy.get_number_counts()
-    draw_at = legacy.get_draw_time()
+    draw_info = _draw_payload()
     _ensure_receipt_table()
     pending_order = None
     with legacy.db() as conn:
@@ -266,7 +320,11 @@ def bootstrap():
         pending_order["numbers"] = json.loads(pending_order.pop("numbers_json"))
         pending_order["round_id"] = legacy.get_current_round()
         pending_order["currency"] = "ETB"
-        pending_order["payment_accounts"] = {"cbe": legacy.CBE_ACCOUNT, "telebirr": legacy.TELEBIRR_NUMBER, "cbebirr": legacy.CBEBIRR_NUMBER}
+        pending_order["payment_accounts"] = {
+            "cbe": legacy.CBE_ACCOUNT,
+            "telebirr": legacy.TELEBIRR_NUMBER,
+            "cbebirr": legacy.CBEBIRR_NUMBER,
+        }
         pending_order["expires_at_ethiopia"] = legacy.format_ethiopia_time(legacy.from_iso(pending_order["expires_at"]))
     return jsonify({
         "user": {
@@ -285,11 +343,28 @@ def bootstrap():
             "prizes": [{"rank": i + 1, "name": name, "amount": amount}
                        for i, (name, amount) in enumerate(legacy.PRIZES)],
             "counts": counts,
-            "draw_at": legacy.to_iso(draw_at) if draw_at else None,
-            "draw_completed": legacy.setting("draw_completed") == "1",
+            "draw_at": draw_info["draw_at"],
+            "draw_at_ethiopia": draw_info["draw_at_ethiopia"],
+            "draw_completed": draw_info["draw_completed"],
+            "seconds_remaining": draw_info["seconds_remaining"],
+            "wheel_url": draw_info["wheel_url"],
         },
+        "draw": draw_info,
         "cart": _cart_payload(user_id),
         "pending_order": pending_order,
+    })
+
+
+@miniapp_api.get("/draw/state")
+@require_telegram_user
+def draw_state():
+    legacy.release_expired_reservations()
+    counts = legacy.get_number_counts()
+    draw_info = _draw_payload()
+    return jsonify({
+        "round_id": legacy.get_current_round(),
+        "counts": counts,
+        "draw": draw_info,
     })
 
 
@@ -346,13 +421,17 @@ def cancel_cart():
 def history():
     user_id = request.telegram_user["user_id"]
     tickets, wins = legacy.fetch_user_history(user_id)
+    global_wins = legacy.fetch_global_history()
+
     def ticket_row(row):
         item = dict(row)
         item["numbers"] = json.loads(item.pop("numbers_json", "[]"))
         return item
+
     return jsonify({
         "tickets": [ticket_row(row) for row in tickets],
         "wins": [dict(row) for row in wins],
+        "global_wins": [dict(row) for row in global_wins],
     })
 
 
@@ -459,8 +538,11 @@ def upload_payment_receipt(order_id: str):
         except Exception:
             try:
                 url, key, bucket = _supabase_config()
-                requests.delete(f"{url}/storage/v1/object/{bucket}/{storage_path}",
-                    headers={"apikey": key, "Authorization": f"Bearer {key}"}, timeout=15)
+                requests.delete(
+                    f"{url}/storage/v1/object/{bucket}/{storage_path}",
+                    headers={"apikey": key, "Authorization": f"Bearer {key}"},
+                    timeout=15,
+                )
             except Exception:
                 logger.exception("Could not clean up orphaned receipt object %s", storage_path)
             raise
@@ -474,16 +556,22 @@ def upload_payment_receipt(order_id: str):
             try:
                 _telegram_api("sendMessage", data={
                     "chat_id": legacy.HOST_TELEGRAM_ID,
-                    "text": (f"⚠️ A payment receipt was uploaded but could not be posted to {legacy.SUPPORT_CHANNEL}.\n"
-                             f"Order: {order_id}\nCustomer: {order['customer_name']}\n"
-                             f"Amount: {order['total']} ETB\nOpen the Mini App admin dashboard to view the private receipt.")
+                    "text": (
+                        f"⚠️ A payment receipt was uploaded but could not be posted to {legacy.SUPPORT_CHANNEL}.\n"
+                        f"Order: {order_id}\nCustomer: {order['customer_name']}\n"
+                        f"Amount: {order['total']} ETB\nOpen the Mini App admin dashboard to view the private receipt."
+                    ),
                 })
             except Exception:
                 logger.exception("Could not send receipt notification fallback to host for order %s", order_id)
         with legacy.db() as conn:
             conn.execute("UPDATE miniapp_receipts SET notification_status=%s WHERE order_id=%s", (notification_status, order_id))
-        return jsonify({"ok": True, "order_id": order_id, "receipt_status": "submitted",
-                        "notification_status": notification_status}), 201
+        return jsonify({
+            "ok": True,
+            "order_id": order_id,
+            "receipt_status": "submitted",
+            "notification_status": notification_status,
+        }), 201
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except RuntimeError as exc:
@@ -559,11 +647,17 @@ def admin_order_decision(order_id: str):
     if decision == "approve":
         try:
             draw_at = legacy.maybe_schedule_draw()
+            if draw_at and legacy.get_number_counts()["sold"] == legacy.TOTAL_NUMBERS:
+                _notify_sold_out_via_api(draw_at)
         except Exception:
             logger.exception("Could not schedule draw after dashboard approval")
-    return jsonify({"ok": True, "order_id": order_id, "decision": decision,
-                    "notification_status": notification_status,
-                    "draw_at": legacy.to_iso(draw_at) if draw_at else None})
+    return jsonify({
+        "ok": True,
+        "order_id": order_id,
+        "decision": decision,
+        "notification_status": notification_status,
+        "draw_at": legacy.to_iso(draw_at) if draw_at else None,
+    })
 
 
 @miniapp_api.post("/telegram/webhook")
@@ -613,7 +707,9 @@ def telegram_webhook():
             logger.exception("Customer notification failed for order %s", order_id)
         if decision == "approve":
             try:
-                legacy.maybe_schedule_draw()
+                draw_at = legacy.maybe_schedule_draw()
+                if draw_at and legacy.get_number_counts()["sold"] == legacy.TOTAL_NUMBERS:
+                    _notify_sold_out_via_api(draw_at)
             except Exception:
                 logger.exception("Draw scheduling check failed after approval")
     elif status == "expired":
