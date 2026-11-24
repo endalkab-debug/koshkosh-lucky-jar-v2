@@ -7,7 +7,6 @@ import os
 import json
 import uuid
 import random
-import re
 import asyncio
 import logging
 import threading
@@ -19,7 +18,6 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from flask import Flask, jsonify, render_template
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
-from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -62,59 +60,70 @@ logger = logging.getLogger("koshkosh-bot")
 
 flask_app = Flask(__name__)
 
+
 @flask_app.route("/")
 def home():
     return "KoshKosh Lucky Jar Bot is running.", 200
+
 
 @flask_app.route("/health")
 def health():
     return {"status": "ok"}, 200
 
+
 @flask_app.route("/wheel")
 def wheel_page():
     return render_template("wheel.html", total_numbers=TOTAL_NUMBERS)
 
+
+def get_wheel_snapshot():
+    with db() as conn:
+        settings_rows = conn.execute(
+            "SELECT key, value FROM app_settings WHERE key IN "
+            "('wheel_round_id','wheel_status','wheel_active_rank','wheel_reveal_count')"
+        ).fetchall()
+        settings = {row["key"]: row["value"] for row in settings_rows}
+        round_row = conn.execute(
+            "SELECT round_number FROM game_state WHERE id=1"
+        ).fetchone()
+        current_round = f"KLR-{round_row['round_number']:05d}" if round_row else "KLR-00001"
+        raw_round = settings.get("wheel_round_id")
+        round_id = raw_round if raw_round and raw_round != "None" else current_round
+        status = settings.get("wheel_status") or "idle"
+        active_rank = int(settings.get("wheel_active_rank") or 0)
+        reveal_count = int(settings.get("wheel_reveal_count") or 0)
+
+        rows = []
+        if status in ("spinning", "complete") and reveal_count > 0:
+            rows = conn.execute(
+                "SELECT prize_rank, prize_name, amount, number, drawn_at "
+                "FROM draw_results WHERE round_id=%s AND prize_rank <= %s "
+                "ORDER BY prize_rank",
+                (round_id, reveal_count),
+            ).fetchall()
+
+    return {
+        "round_id": round_id,
+        "status": status,
+        "active_rank": active_rank,
+        "revealed_count": reveal_count,
+        "total_numbers": TOTAL_NUMBERS,
+        "results": [dict(row) for row in rows],
+    }
+
+
 @flask_app.route("/api/wheel/state")
 def wheel_state_api():
     try:
-        with db() as conn:
-            settings_rows = conn.execute(
-                "SELECT key, value FROM app_settings WHERE key IN "
-                "('wheel_round_id','wheel_status','wheel_active_rank','wheel_reveal_count')"
-            ).fetchall()
-            settings = {row["key"]: row["value"] for row in settings_rows}
-            round_row = conn.execute(
-                "SELECT round_number FROM game_state WHERE id=1"
-            ).fetchone()
-            current_round = f"KLR-{round_row['round_number']:05d}" if round_row else "KLR-00001"
-            round_id = settings.get("wheel_round_id") or current_round
-            status = settings.get("wheel_status") or "idle"
-            active_rank = int(settings.get("wheel_active_rank") or 0)
-            reveal_count = int(settings.get("wheel_reveal_count") or 0)
-            
-            rows = []
-            if status in ("spinning", "complete") and reveal_count > 0:
-                rows = conn.execute(
-                    "SELECT prize_rank, prize_name, amount, number, drawn_at "
-                    "FROM draw_results WHERE round_id=%s AND prize_rank <= %s "
-                    "ORDER BY prize_rank",
-                    (round_id, reveal_count),
-                ).fetchall()
-
-        return jsonify({
-            "round_id": round_id,
-            "status": status,
-            "active_rank": active_rank,
-            "revealed_count": reveal_count,
-            "total_numbers": TOTAL_NUMBERS,
-            "results": [dict(row) for row in rows],
-        }), 200
+        return jsonify(get_wheel_snapshot()), 200
     except Exception:
         logger.exception("Wheel state API failed")
         return jsonify({"error": "Wheel state is temporarily unavailable."}), 503
 
+
 def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
 
 # ---------------------------------------------------------------------------
 # TIME / CONNECTION POOL HELPERS
@@ -122,20 +131,24 @@ def run_flask():
 def utc_now():
     return datetime.now(timezone.utc)
 
+
 def to_iso(value):
     return value.astimezone(timezone.utc).isoformat()
 
+
 def from_iso(value):
-    if not value:
+    if not value or value == "None":
         return None
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
 
+
 db_pool = None
 LANGUAGE_CACHE = {}
 LANGUAGE_CACHE_TTL = 300
+
 
 def init_db_pool():
     global db_pool
@@ -150,6 +163,7 @@ def init_db_pool():
         kwargs={"row_factory": dict_row, "connect_timeout": 8},
     )
 
+
 @contextmanager
 def db():
     if db_pool is None:
@@ -162,6 +176,7 @@ def db():
             conn.rollback()
             raise
 
+
 def ensure_user(user_id):
     with db() as conn:
         conn.execute(
@@ -172,6 +187,7 @@ def ensure_user(user_id):
     language = row["language"] if row else "en"
     LANGUAGE_CACHE[user_id] = (language, time.monotonic())
     return language
+
 
 def get_language(user_id):
     cached = LANGUAGE_CACHE.get(user_id)
@@ -185,6 +201,7 @@ def get_language(user_id):
     LANGUAGE_CACHE[user_id] = (language, time.monotonic())
     return language
 
+
 def set_language(user_id, language):
     ensure_user(user_id)
     with db() as conn:
@@ -194,12 +211,14 @@ def set_language(user_id, language):
         )
     LANGUAGE_CACHE[user_id] = (language, time.monotonic())
 
+
 def setting(key):
     with db() as conn:
         row = conn.execute(
             "SELECT value FROM app_settings WHERE key=%s", (key,)
         ).fetchone()
     return row["value"] if row else None
+
 
 def set_setting(key, value):
     with db() as conn:
@@ -209,11 +228,13 @@ def set_setting(key, value):
             (key, value),
         )
 
+
 def get_current_round():
     with db() as conn:
         row = conn.execute("SELECT round_number FROM game_state WHERE id=1").fetchone()
     round_num = row["round_number"] if row else 1
     return f"KLR-{round_num:05d}"
+
 
 def init_db():
     with db() as conn:
@@ -307,6 +328,7 @@ def init_db():
         conn.execute("INSERT INTO app_settings(key,value) VALUES('wheel_status', 'idle') ON CONFLICT DO NOTHING")
         conn.execute("INSERT INTO app_settings(key,value) VALUES('wheel_active_rank', '0') ON CONFLICT DO NOTHING")
         conn.execute("INSERT INTO app_settings(key,value) VALUES('wheel_reveal_count', '0') ON CONFLICT DO NOTHING")
+
 
 # ---------------------------------------------------------------------------
 # TRANSLATIONS
@@ -412,7 +434,7 @@ LANGUAGES = {
             "Phone: {customer_phone}\n\n"
             "The host will contact you for your payout."
         ),
-        "host_payout_list": "🏆 KOSHKOSH LUCKY JAR — 3 WINNERS PAYOUT LIST:\n\n{winner_details}"
+        "host_payout_list": "🏆 KOSHKOSH LUCKY JAR — 3 WINNERS PAYOUT LIST:\n\n{winner_details}",
     },
     "am": {
         "welcome": "🎉 እንኳን ወደ ኮሽኮሽ ሎተሪ በደህና መጡ!\nዙር፦ {round_id}\n\nከታች ከቀረቡት አማራጮች ውስጥ ይምረጡ።",
@@ -500,9 +522,10 @@ LANGUAGES = {
             "ስልክ ቁጥር: {customer_phone}\n\n"
             "ሽልማትዎን ለማስረከብ አጫዋቹ ያነጋግርዎታል።"
         ),
-        "host_payout_list": "🏆 የኮሽኮሽ ሎተሪ — 3 አሸናፊዎች የክፍያ ዝርዝር:\n\n{winner_details}"
+        "host_payout_list": "🏆 የኮሽኮሽ ሎተሪ — 3 አሸናፊዎች የክፍያ ዝርዝር:\n\n{winner_details}",
     },
 }
+
 
 def tr(user_id, key, **kwargs):
     language = get_language(user_id)
@@ -510,6 +533,7 @@ def tr(user_id, key, **kwargs):
         key, LANGUAGES["en"].get(key, key)
     )
     return template.format(**kwargs) if kwargs else template
+
 
 def language_keyboard():
     return InlineKeyboardMarkup([
@@ -520,6 +544,7 @@ def language_keyboard():
         [InlineKeyboardButton("🔙 Back", callback_data="menu")],
     ])
 
+
 def wheel_launch_keyboard(user_id="en"):
     if not WHEEL_WEBAPP_URL:
         return None
@@ -527,38 +552,41 @@ def wheel_launch_keyboard(user_id="en"):
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(
             btn_text,
-            web_app=WebAppInfo(url=WHEEL_WEBAPP_URL)
+            web_app=WebAppInfo(url=WHEEL_WEBAPP_URL),
         )
     ]])
+
 
 def main_menu_keyboard(user_id):
     rows = [
         [InlineKeyboardButton(tr(user_id, "play"), callback_data="play")],
         [
             InlineKeyboardButton(tr(user_id, "board"), callback_data="board"),
-            InlineKeyboardButton(tr(user_id, "draw_info"), callback_data="draw_info")
+            InlineKeyboardButton(tr(user_id, "draw_info"), callback_data="draw_info"),
         ],
         [
             InlineKeyboardButton(tr(user_id, "rules"), callback_data="rules"),
-            InlineKeyboardButton(tr(user_id, "language"), callback_data="language")
+            InlineKeyboardButton(tr(user_id, "language"), callback_data="language"),
         ],
         [
             InlineKeyboardButton(tr(user_id, "history_info"), callback_data="history"),
-            InlineKeyboardButton(tr(user_id, "contact"), callback_data="support")
-        ]
+            InlineKeyboardButton(tr(user_id, "contact"), callback_data="support"),
+        ],
     ]
     if WHEEL_WEBAPP_URL:
         wheel_label = "Watch Live Draw" if get_language(user_id) == "en" else "ቀጥታ የዕጣ አወጣጥ ይመልከቱ"
         rows.insert(1, [InlineKeyboardButton(
             f"🎡 {wheel_label}",
-            web_app=WebAppInfo(url=WHEEL_WEBAPP_URL)
+            web_app=WebAppInfo(url=WHEEL_WEBAPP_URL),
         )])
     return InlineKeyboardMarkup(rows)
+
 
 def back_keyboard(user_id):
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(tr(user_id, "back"), callback_data="menu")
     ]])
+
 
 def approval_keyboard(order_id, language):
     labels = LANGUAGES.get(language, LANGUAGES["en"])
@@ -566,6 +594,7 @@ def approval_keyboard(order_id, language):
         InlineKeyboardButton(labels["approved_button"], callback_data=f"approve:{order_id}"),
         InlineKeyboardButton(labels["rejected_button"], callback_data=f"reject:{order_id}"),
     ]])
+
 
 # ---------------------------------------------------------------------------
 # RESERVATION / ORDER LOGIC & CACHING
@@ -584,13 +613,14 @@ def get_cart(user_id, context=None):
     result = dict(row)
     result["numbers"] = json.loads(result["numbers_json"])
     result["expires"] = from_iso(result["expires_at"])
-    if result["expires"] <= utc_now():
+    if not result["expires"] or result["expires"] <= utc_now():
         if context:
             context.user_data["cart_cache"] = None
         return None
     if context:
         context.user_data["cart_cache"] = result
     return result
+
 
 def get_active_order(user_id):
     with db() as conn:
@@ -600,6 +630,7 @@ def get_active_order(user_id):
             (user_id,),
         ).fetchone()
     return dict(row) if row else None
+
 
 def release_expired_reservations():
     now = to_iso(utc_now())
@@ -620,6 +651,7 @@ def release_expired_reservations():
             )
             conn.execute("DELETE FROM carts WHERE user_id=%s", (cart["user_id"],))
 
+
 def get_number_counts():
     with db() as conn:
         rows = conn.execute(
@@ -629,6 +661,7 @@ def get_number_counts():
     for row in rows:
         counts[row["status"]] = row["count"]
     return counts
+
 
 def get_cached_board_data(context, start_num, end_num):
     now_t = time.monotonic()
@@ -704,7 +737,7 @@ def get_cached_board_data(context, start_num, end_num):
             processed_customers.append({
                 "customer_name": sc["customer_name"],
                 "customer_phone": sc["customer_phone"],
-                "numbers": sorted(valid_nums)
+                "numbers": sorted(valid_nums),
             })
     if context:
         if not cache or now_t - cache.get("timestamp", 0) >= 3:
@@ -713,12 +746,15 @@ def get_cached_board_data(context, start_num, end_num):
         context.bot_data["board_cache"] = cache
     return counts, statuses, processed_customers
 
+
 def get_draw_time():
     return from_iso(setting("draw_at"))
+
 
 def format_ethiopia_time(value):
     local = value.astimezone(timezone(timedelta(hours=3)))
     return local.strftime("%Y-%m-%d %H:%M:%S")
+
 
 def remaining_text(seconds):
     seconds = max(0, int(seconds))
@@ -726,14 +762,15 @@ def remaining_text(seconds):
     minutes, secs = divmod(remainder, 60)
     return f"{hours}h {minutes}m {secs}s"
 
+
 def number_grid_keyboard(user_id, cart, statuses, page=1):
     selected = set(cart["numbers"]) if cart and cart.get("numbers") else set()
     rows, row = [], []
-    
+
     per_page = 50
     start_num = (page - 1) * per_page + 1
     end_num = min(page * per_page, TOTAL_NUMBERS)
-    
+
     for number in range(start_num, end_num + 1):
         status = statuses.get(number, {"status": "available"})
         if number in selected:
@@ -744,9 +781,9 @@ def number_grid_keyboard(user_id, cart, statuses, page=1):
             label, callback = f"⏳{number}", "noop"
         else:
             label, callback = f"🟢{number}", f"toggle:{number}:{page}"
-            
+
         row.append(InlineKeyboardButton(label, callback_data=callback))
-        
+
         if len(row) == 5:
             rows.append(row)
             row = []
@@ -764,11 +801,12 @@ def number_grid_keyboard(user_id, cart, statuses, page=1):
     if selected:
         rows.append([
             InlineKeyboardButton(tr(user_id, "checkout"), callback_data="checkout"),
-            InlineKeyboardButton(tr(user_id, "cancel"), callback_data="cancel")
+            InlineKeyboardButton(tr(user_id, "cancel"), callback_data="cancel"),
         ])
-        
+
     rows.append([InlineKeyboardButton(tr(user_id, "back"), callback_data="menu")])
     return InlineKeyboardMarkup(rows)
+
 
 async def show_number_grid(target, user_id, context=None, page=1):
     counts, statuses_slice, _ = await asyncio.to_thread(
@@ -778,7 +816,7 @@ async def show_number_grid(target, user_id, context=None, page=1):
 
     message = tr(user_id, "select_numbers", price=PRICE_PER_NUMBER)
     message += f"\n\n📄 Page {page} of 2 (Numbers {(page-1)*50 + 1}–{min(page*50, TOTAL_NUMBERS)})"
-    
+
     if cart and cart.get("numbers"):
         numbers = sorted(cart["numbers"])
         seconds = (cart["expires"] - utc_now()).total_seconds()
@@ -794,6 +832,7 @@ async def show_number_grid(target, user_id, context=None, page=1):
         await target.edit_text(message, reply_markup=markup)
     else:
         await target.reply_text(message, reply_markup=markup)
+
 
 def toggle_number_transaction(user_id, number):
     now = utc_now()
@@ -897,6 +936,7 @@ def toggle_number_transaction(user_id, number):
             c_dict[r["status"]] = r["count"]
         return "added", numbers, c_dict, updated_cart
 
+
 def cancel_user_cart(user_id):
     with db() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(7410920261109)")
@@ -908,9 +948,10 @@ def cancel_user_cart(user_id):
             )
             conn.execute(
                 "UPDATE orders SET status='cancelled' WHERE cart_token=%s AND status='awaiting_payment'",
-                (cart["token"],)
+                (cart["token"],),
             )
             conn.execute("DELETE FROM carts WHERE user_id=%s", (user_id,))
+
 
 def begin_checkout(user_id):
     with db() as conn:
@@ -933,6 +974,7 @@ def begin_checkout(user_id):
         )
         return "ok"
 
+
 def save_customer_name(user_id, name):
     with db() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(7410920261109)")
@@ -946,6 +988,7 @@ def save_customer_name(user_id, name):
             (name, user_id),
         )
         return "ok"
+
 
 def create_order(user_id, phone):
     with db() as conn:
@@ -1001,6 +1044,7 @@ def create_order(user_id, phone):
             "expires_at": cart["expires_at"],
         }, "ok"
 
+
 def process_order_decision(order_id, decision):
     with db() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(7410920261109)")
@@ -1038,6 +1082,7 @@ def process_order_decision(order_id, decision):
         conn.execute("DELETE FROM carts WHERE user_id=%s", (order["user_id"],))
         return dict(order), "ok"
 
+
 def maybe_schedule_draw():
     with db() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(7410920261109)")
@@ -1063,6 +1108,7 @@ def maybe_schedule_draw():
         conn.execute("UPDATE app_settings SET value='0' WHERE key='warning_sent_5min'")
         conn.execute("UPDATE app_settings SET value='0' WHERE key='warning_live_sent'")
         return draw_at
+
 
 def prepare_draw_if_due():
     with db() as conn:
@@ -1113,7 +1159,8 @@ def prepare_draw_if_due():
         if not participant_ids:
             participant_ids.add(HOST_TELEGRAM_ID)
 
-        winners = random.SystemRandom().sample(list(sold), 3)
+        prize_count = min(len(PRIZES), len(sold))
+        winners = random.SystemRandom().sample(list(sold), prize_count)
         now = to_iso(utc_now())
         current_round = get_current_round()
 
@@ -1132,7 +1179,7 @@ def prepare_draw_if_due():
             )
 
         result_rows = []
-        for rank, (prize_name, amount) in enumerate(PRIZES, start=1):
+        for rank, (prize_name, amount) in enumerate(PRIZES[:prize_count], start=1):
             winner = winners[rank - 1]
             win_num = winner["number"]
             owner_info = number_owner_map.get(win_num) or {
@@ -1163,6 +1210,7 @@ def prepare_draw_if_due():
         users = [{"user_id": uid} for uid in participant_ids]
         return result_rows, users
 
+
 def reset_after_draw():
     with db() as conn:
         conn.execute(
@@ -1173,13 +1221,14 @@ def reset_after_draw():
         conn.execute("UPDATE app_settings SET value='0' WHERE key='draw_completed'")
         conn.execute("UPDATE app_settings SET value='0' WHERE key='warning_sent_5min'")
         conn.execute("UPDATE app_settings SET value='0' WHERE key='warning_live_sent'")
-        conn.execute("UPDATE app_settings SET value='None' WHERE key='wheel_round_id'")
+        conn.execute("UPDATE app_settings SET value=NULL WHERE key='wheel_round_id'")
         conn.execute("UPDATE app_settings SET value='idle' WHERE key='wheel_status'")
         conn.execute("UPDATE app_settings SET value='0' WHERE key='wheel_active_rank'")
         conn.execute("UPDATE app_settings SET value='0' WHERE key='wheel_reveal_count'")
         conn.execute("UPDATE game_state SET round_number=round_number+1 WHERE id=1")
         row = conn.execute("SELECT round_number FROM game_state WHERE id=1").fetchone()
         return f"KLR-{row['round_number']:05d}"
+
 
 async def send_live_draw_launch_notification(application):
     msg = (
@@ -1193,7 +1242,7 @@ async def send_live_draw_launch_notification(application):
         )
     except Exception:
         pass
-    
+
     all_users = await asyncio.to_thread(get_all_user_ids)
     for user_row in all_users:
         u_id = user_row["user_id"]
@@ -1211,176 +1260,186 @@ async def send_live_draw_launch_notification(application):
         except Exception:
             pass
 
+
 async def execute_draw_sequence(application):
     prepared = await asyncio.to_thread(prepare_draw_if_due)
     if not prepared:
         return
     result_rows, sold_users = prepared
 
-    if WHEEL_WEBAPP_URL:
-        for user_row in sold_users:
-            u_id = user_row["user_id"]
-            lang = get_language(u_id)
-            launch_text = LANGUAGES[lang]["wheel_launch_msg"]
-            launch_markup = wheel_launch_keyboard(u_id)
+    try:
+        if WHEEL_WEBAPP_URL:
+            for user_row in sold_users:
+                u_id = user_row["user_id"]
+                lang = get_language(u_id)
+                launch_text = LANGUAGES[lang]["wheel_launch_msg"]
+                launch_markup = wheel_launch_keyboard(u_id)
+                try:
+                    await application.bot.send_message(
+                        chat_id=u_id,
+                        text=launch_text,
+                        parse_mode="Markdown",
+                        reply_markup=launch_markup,
+                    )
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    logger.exception("Could not send wheel launch button to participant")
+
             try:
                 await application.bot.send_message(
-                    chat_id=u_id,
-                    text=launch_text,
+                    chat_id=SUPPORT_CHANNEL,
+                    text=LANGUAGES["en"]["wheel_launch_msg"],
                     parse_mode="Markdown",
-                    reply_markup=launch_markup,
+                    reply_markup=wheel_launch_keyboard("en"),
                 )
-                await asyncio.sleep(0.05)
-            except Exception:
-                logger.exception("Could not send wheel launch button to participant")
-
-        try:
-            await application.bot.send_message(
-                chat_id=SUPPORT_CHANNEL,
-                text=LANGUAGES["en"]["wheel_launch_msg"],
-                parse_mode="Markdown",
-                reply_markup=wheel_launch_keyboard("en"),
-            )
-        except Exception:
-            pass
-
-    winner_user_ids = {row["winner_user_id"] for row in result_rows}
-
-    # Sort results in natural podium order: 1st place (rank 1), then 2nd place (rank 2), then 3rd place (rank 3)
-    sorted_results = sorted(result_rows, key=lambda x: x["prize_rank"])
-
-    for row in sorted_results:
-        rank = row["prize_rank"]
-        rank_emoji = "🥇" if rank == 1 else ("🥈" if rank == 2 else "🥉")
-        final_number = row["number"]
-
-        await asyncio.to_thread(set_setting, "wheel_active_rank", str(rank))
-        await asyncio.to_thread(set_setting, "wheel_status", "spinning")
-
-        spin_msg = (
-            f"🎰 **Spinning for {rank_emoji} {row['prize_name']}...** 🎡\n\n"
-            f"Watch the live wheel spin in the Mini App!"
-        )
-        try:
-            spin_message = await application.bot.send_message(
-                chat_id=SUPPORT_CHANNEL,
-                text=spin_msg,
-                parse_mode="Markdown",
-            )
-        except Exception:
-            spin_message = None
-
-        await asyncio.sleep(4.0)
-
-        await asyncio.to_thread(set_setting, "wheel_reveal_count", str(rank))
-        if rank == len(result_rows):
-            await asyncio.to_thread(set_setting, "wheel_status", "complete")
-
-        prize_text = (
-            f"🏆 **OFFICIAL WINNER!**\n\n"
-            f"{rank_emoji} **{row['prize_name']}**\n"
-            f"Amount: **{row['amount']:,} ETB**\n"
-            f"Winning Number: **{final_number}**\n"
-            f"Winner: {row['customer_name']} ({row['customer_phone']})"
-        )
-        
-        if spin_message:
-            try:
-                await spin_message.edit_text(prize_text, parse_mode="Markdown")
-            except Exception:
-                await application.bot.send_message(chat_id=SUPPORT_CHANNEL, text=prize_text, parse_mode="Markdown")
-        else:
-            try:
-                await application.bot.send_message(chat_id=SUPPORT_CHANNEL, text=prize_text, parse_mode="Markdown")
             except Exception:
                 pass
 
-        for uid in winner_user_ids:
-            if uid == row["winner_user_id"]:
-                lang = get_language(uid)
-                p_text = LANGUAGES[lang]["winner_private_msg"].format(
-                    rank_emoji=rank_emoji,
-                    prize_name=row["prize_name"],
-                    amount=row["amount"],
-                    final_number=final_number,
-                    customer_name=row["customer_name"],
-                    customer_phone=row["customer_phone"]
+        winner_user_ids = {row["winner_user_id"] for row in result_rows}
+        sorted_results = sorted(result_rows, key=lambda x: x["prize_rank"])
+
+        for row in sorted_results:
+            rank = row["prize_rank"]
+            rank_emoji = "🥇" if rank == 1 else ("🥈" if rank == 2 else "🥉")
+            final_number = row["number"]
+
+            await asyncio.to_thread(set_setting, "wheel_active_rank", str(rank))
+            await asyncio.to_thread(set_setting, "wheel_status", "spinning")
+
+            spin_msg = (
+                f"🎰 **Spinning for {rank_emoji} {row['prize_name']}...** 🎡\n\n"
+                f"Watch the live wheel spin in the Mini App!"
+            )
+            try:
+                spin_message = await application.bot.send_message(
+                    chat_id=SUPPORT_CHANNEL,
+                    text=spin_msg,
+                    parse_mode="Markdown",
                 )
+            except Exception:
+                spin_message = None
+
+            await asyncio.sleep(4.0)
+
+            await asyncio.to_thread(set_setting, "wheel_reveal_count", str(rank))
+            if rank == len(result_rows):
+                await asyncio.to_thread(set_setting, "wheel_status", "complete")
+
+            prize_text = (
+                f"🏆 **OFFICIAL WINNER!**\n\n"
+                f"{rank_emoji} **{row['prize_name']}**\n"
+                f"Amount: **{row['amount']:,} ETB**\n"
+                f"Winning Number: **{final_number}**\n"
+                f"Winner: {row['customer_name']} ({row['customer_phone']})"
+            )
+
+            if spin_message:
                 try:
-                    await application.bot.send_message(
-                        chat_id=uid,
-                        text=p_text,
-                        parse_mode="Markdown",
-                    )
+                    await spin_message.edit_text(prize_text, parse_mode="Markdown")
                 except Exception:
-                    logger.exception("Could not notify winner privately")
+                    try:
+                        await application.bot.send_message(chat_id=SUPPORT_CHANNEL, text=prize_text, parse_mode="Markdown")
+                    except Exception:
+                        pass
+            else:
+                try:
+                    await application.bot.send_message(chat_id=SUPPORT_CHANNEL, text=prize_text, parse_mode="Markdown")
+                except Exception:
+                    pass
+
+            for uid in winner_user_ids:
+                if uid == row["winner_user_id"]:
+                    lang = get_language(uid)
+                    p_text = LANGUAGES[lang]["winner_private_msg"].format(
+                        rank_emoji=rank_emoji,
+                        prize_name=row["prize_name"],
+                        amount=row["amount"],
+                        final_number=final_number,
+                        customer_name=row["customer_name"],
+                        customer_phone=row["customer_phone"],
+                    )
+                    try:
+                        await application.bot.send_message(
+                            chat_id=uid,
+                            text=p_text,
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        logger.exception("Could not notify winner privately")
+
+            await asyncio.sleep(3)
+
+        winner_details_lines_en = []
+        for row in sorted_results:
+            winner_details_lines_en.append(
+                f"{row['prize_name']} ({row['amount']:,} ETB)\n"
+                f"Number: {row['number']}\n"
+                f"Winner Name: {row['customer_name']}\n"
+                f"Phone: {row['customer_phone']}"
+            )
+        try:
+            host_msg = LANGUAGES["en"]["host_payout_list"].format(winner_details="\n\n".join(winner_details_lines_en))
+            await application.bot.send_message(chat_id=HOST_TELEGRAM_ID, text=host_msg)
+        except Exception:
+            logger.exception("Could not notify host")
+
+        final_results_text_en = "\n\n".join([
+            f"{row['prize_name']} — {row['amount']:,} ETB | Number {row['number']}"
+            for row in sorted_results
+        ])
+        final_results_text_am = "\n\n".join([
+            f"{row['prize_name']} — {row['amount']:,} ብር | ቁጥር {row['number']}"
+            for row in sorted_results
+        ])
 
         await asyncio.sleep(3)
-
-    winner_details_lines_en = []
-    for row in sorted_results:
-        winner_details_lines_en.append(
-            f"{row['prize_name']} ({row['amount']:,} ETB)\n"
-            f"Number: {row['number']}\n"
-            f"Winner Name: {row['customer_name']}\n"
-            f"Phone: {row['customer_phone']}"
-        )
-    try:
-        host_msg = LANGUAGES["en"]["host_payout_list"].format(winner_details="\n\n".join(winner_details_lines_en))
-        await application.bot.send_message(chat_id=HOST_TELEGRAM_ID, text=host_msg)
-    except Exception:
-        logger.exception("Could not notify host")
-
-    final_results_text_en = "\n\n".join([
-        f"{row['prize_name']} — {row['amount']:,} ETB | Number {row['number']}"
-        for row in sorted_results
-    ])
-    final_results_text_am = "\n\n".join([
-        f"{row['prize_name']} — {row['amount']:,} ብር | ቁጥር {row['number']}"
-        for row in sorted_results
-    ])
-
-    await asyncio.sleep(3)
-    for user_row in sold_users:
-        user_id = user_row["user_id"]
-        if user_id in winner_user_ids:
-            continue
-        lang = get_language(user_id)
-        res_text = (
-            "🏆 KOSHKOSH LUCKY JAR DRAW RESULTS\n\n" + final_results_text_en
-            if lang == "en" else
-            "🏆 የኮሽኮሽ ሎተሪ የዕጣ ውጤቶች\n\n" + final_results_text_am
-        )
-        try:
-            await application.bot.send_message(chat_id=user_id, text=res_text)
-            await asyncio.sleep(0.05)
-        except Exception:
-            pass
-
-    new_round = await asyncio.to_thread(reset_after_draw)
-    application.bot_data.pop("board_cache", None)
-
-    try:
-        support_new_round_text = f"🔄 {new_round} ዙር ተጀመረ! የዕጣ ቁጥሮች አሁን ለአዲስ የዕጣ ዙር ጨዋታ ዝግጁ ናቸው። ለ {new_round} የዕጣ ጨዋታ የዕድል ቁጥርዎትን አሁኑኑ ይምረጡ!"
-        await application.bot.send_message(
-            chat_id=SUPPORT_CHANNEL,
-            text=support_new_round_text,
-        )
-    except Exception:
-        pass
-
-    for user_row in sold_users:
-        user_id = user_row["user_id"]
-        try:
-            priv_new_round_text = f"🔄 {new_round} ዙር ተጀመረ! የዕጣ ቁጥሮች አሁን ለአዲስ የዕጣ ዙር ጨዋታ ዝግጁ ናቸው። ለ {new_round} የዕጣ ጨዋታ የዕድል ቁጥርዎትን አሁኑኑ ይምረጡ!"
-            await application.bot.send_message(
-                chat_id=user_id,
-                text=priv_new_round_text,
-                reply_markup=main_menu_keyboard(user_id),
+        for user_row in sold_users:
+            user_id = user_row["user_id"]
+            if user_id in winner_user_ids:
+                continue
+            lang = get_language(user_id)
+            res_text = (
+                "🏆 KOSHKOSH LUCKY JAR DRAW RESULTS\n\n" + final_results_text_en
+                if lang == "en" else
+                "🏆 የኮሽኮሽ ሎተሪ የዕጣ ውጤቶች\n\n" + final_results_text_am
             )
-            await asyncio.sleep(0.05)
+            try:
+                await application.bot.send_message(chat_id=user_id, text=res_text)
+                await asyncio.sleep(0.05)
+            except Exception:
+                pass
+    finally:
+        new_round = await asyncio.to_thread(reset_after_draw)
+        application.bot_data.pop("board_cache", None)
+
+        try:
+            support_new_round_text = (
+                f"🔄 {new_round} ዙር ተጀመረ! የዕጣ ቁጥሮች አሁን ለአዲስ የዕጣ ዙር ጨዋታ ዝግጁ ናቸው። "
+                f"ለ {new_round} የዕጣ ጨዋታ የዕድል ቁጥርዎትን አሁኑኑ ይምረጡ!"
+            )
+            await application.bot.send_message(
+                chat_id=SUPPORT_CHANNEL,
+                text=support_new_round_text,
+            )
         except Exception:
             pass
+
+        for user_row in sold_users:
+            user_id = user_row["user_id"]
+            try:
+                priv_new_round_text = (
+                    f"🔄 {new_round} ዙር ተጀመረ! የዕጣ ቁጥሮች አሁን ለአዲስ የዕጣ ዙር ጨዋታ ዝግጁ ናቸው። "
+                    f"ለ {new_round} የዕጣ ጨዋታ የዕድል ቁጥርዎትን አሁኑኑ ይምረጡ!"
+                )
+                await application.bot.send_message(
+                    chat_id=user_id,
+                    text=priv_new_round_text,
+                    reply_markup=main_menu_keyboard(user_id),
+                )
+                await asyncio.sleep(0.05)
+            except Exception:
+                pass
+
 
 def get_sold_user_ids():
     with db() as conn:
@@ -1388,13 +1447,16 @@ def get_sold_user_ids():
             "SELECT DISTINCT user_id FROM numbers WHERE status='sold' AND user_id IS NOT NULL"
         ).fetchall()
 
+
 def get_all_user_ids():
     with db() as conn:
         return conn.execute(
             "SELECT user_id FROM users WHERE user_id IS NOT NULL"
         ).fetchall()
 
+
 maintenance_lock = asyncio.Lock()
+
 
 async def maintenance_job(context: ContextTypes.DEFAULT_TYPE):
     if maintenance_lock.locked():
@@ -1406,7 +1468,7 @@ async def maintenance_job(context: ContextTypes.DEFAULT_TYPE):
 
             last_fomo = await asyncio.to_thread(setting, "last_fomo_sent")
             now = utc_now()
-            
+
             try:
                 last_fomo_time = from_iso(last_fomo) if last_fomo and last_fomo != "0" else None
             except Exception:
@@ -1414,15 +1476,15 @@ async def maintenance_job(context: ContextTypes.DEFAULT_TYPE):
 
             if not last_fomo_time or (now - last_fomo_time).total_seconds() >= 10800:
                 await asyncio.to_thread(set_setting, "last_fomo_sent", to_iso(now))
-                
+
                 counts, _, sold_customers = await asyncio.to_thread(
                     get_cached_board_data, context, 1, TOTAL_NUMBERS
                 )
-                
+
                 if sold_customers:
                     customer_lines = []
                     for c in sold_customers:
-                        nums_str = ", ".join(map(str, c['numbers']))
+                        nums_str = ", ".join(map(str, c["numbers"]))
                         customer_lines.append(f"{c['customer_name']}    {c['customer_phone']}    {nums_str}")
                     raw_customer_list = "\n".join(customer_lines)
                 else:
@@ -1432,14 +1494,14 @@ async def maintenance_job(context: ContextTypes.DEFAULT_TYPE):
                     available=counts["available"],
                     reserved=counts["reserved"],
                     sold=counts["sold"],
-                    customer_list=raw_customer_list or LANGUAGES["en"]["no_sold_customers"]
+                    customer_list=raw_customer_list or LANGUAGES["en"]["no_sold_customers"],
                 ) + f"\n\n👉 {BOT_USERNAME}"
-                
+
                 try:
                     await context.application.bot.send_message(
                         chat_id=SUPPORT_CHANNEL,
                         text=channel_msg,
-                        parse_mode="Markdown"
+                        parse_mode="Markdown",
                     )
                 except Exception:
                     pass
@@ -1450,19 +1512,19 @@ async def maintenance_job(context: ContextTypes.DEFAULT_TYPE):
                     lang = await asyncio.to_thread(get_language, u_id)
                     lang_dict = LANGUAGES.get(lang, LANGUAGES["en"])
                     user_customer_list = raw_customer_list or lang_dict["no_sold_customers"]
-                    
+
                     user_msg = lang_dict["board_text"].format(
                         available=counts["available"],
                         reserved=counts["reserved"],
                         sold=counts["sold"],
-                        customer_list=user_customer_list
+                        customer_list=user_customer_list,
                     ) + f"\n\n👉 {BOT_USERNAME}"
-                    
+
                     try:
                         await context.application.bot.send_message(
                             chat_id=u_id,
                             text=user_msg,
-                            parse_mode="Markdown"
+                            parse_mode="Markdown",
                         )
                         await asyncio.sleep(0.05)
                     except Exception:
@@ -1478,7 +1540,6 @@ async def maintenance_job(context: ContextTypes.DEFAULT_TYPE):
                 seconds_remaining = (draw_at - now).total_seconds()
                 minutes_remaining = seconds_remaining / 60.0
 
-                # 45-second launch notification
                 if 0.0 < seconds_remaining <= 45.0:
                     flag_key = "warning_live_sent"
                     flag_val = await asyncio.to_thread(setting, flag_key)
@@ -1486,22 +1547,21 @@ async def maintenance_job(context: ContextTypes.DEFAULT_TYPE):
                         await asyncio.to_thread(set_setting, flag_key, "1")
                         await send_live_draw_launch_notification(context.application)
 
-                # 5-minute warning notification broadcasted to channel and all users
                 elif 4.0 < minutes_remaining <= 5.0:
                     flag_key = "warning_sent_5min"
                     flag_val = await asyncio.to_thread(setting, flag_key)
                     if flag_val != "1":
                         await asyncio.to_thread(set_setting, flag_key, "1")
                         round_id = await asyncio.to_thread(get_current_round)
-                        
+
                         try:
                             await context.application.bot.send_message(
                                 chat_id=SUPPORT_CHANNEL,
-                                text=f"⏰ Only 5 minutes left! The draw for round {round_id} will start in 5 minutes. Get ready! 🎰"
+                                text=f"⏰ Only 5 minutes left! The draw for round {round_id} will start in 5 minutes. Get ready! 🎰",
                             )
                         except Exception:
                             logger.exception("Could not send 5-minute warning to support channel")
-                            
+
                         all_users = await asyncio.to_thread(get_all_user_ids)
                         for user_row in all_users:
                             u_id = user_row["user_id"]
@@ -1519,17 +1579,18 @@ async def maintenance_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception("Scheduled maintenance failed")
 
+
 async def broadcast_sold_out(application, draw_at_time):
     round_id = await asyncio.to_thread(get_current_round)
     draw_time_str = format_ethiopia_time(draw_at_time)
-    
+
     msg_en = LANGUAGES["en"]["sold_out"].format(round_id=round_id, draw_time=draw_time_str)
-    
+
     try:
         await application.bot.send_message(chat_id=SUPPORT_CHANNEL, text=msg_en)
     except Exception:
         pass
-        
+
     all_users = await asyncio.to_thread(get_all_user_ids)
     for user_row in all_users:
         u_id = user_row["user_id"]
@@ -1541,6 +1602,7 @@ async def broadcast_sold_out(application, draw_at_time):
         except Exception:
             pass
 
+
 # ---------------------------------------------------------------------------
 # GAME HISTORY FUNCTIONS
 # ---------------------------------------------------------------------------
@@ -1548,7 +1610,7 @@ def fetch_user_history(user_id):
     with db() as conn:
         tickets = conn.execute(
             "SELECT order_id, numbers_json, total, created_at FROM orders WHERE user_id=%s AND status='approved' ORDER BY created_at DESC LIMIT 5",
-            (user_id,)
+            (user_id,),
         ).fetchall()
         wins = conn.execute(
             """
@@ -1556,12 +1618,13 @@ def fetch_user_history(user_id):
                    (SELECT customer_name FROM orders WHERE user_id = dr.winner_user_id LIMIT 1) as customer_name,
                    (SELECT customer_phone FROM orders WHERE user_id = dr.winner_user_id LIMIT 1) as customer_phone
             FROM draw_results dr
-            WHERE dr.winner_user_id=%s 
+            WHERE dr.winner_user_id=%s
             ORDER BY dr.drawn_at DESC LIMIT 5
             """,
-            (user_id,)
+            (user_id,),
         ).fetchall()
     return tickets, wins
+
 
 def fetch_global_history():
     with db() as conn:
@@ -1575,37 +1638,38 @@ def fetch_global_history():
             """
         ).fetchall()
 
+
 async def show_history(message, user_id):
     try:
         tickets, wins = await asyncio.to_thread(fetch_user_history, user_id)
         global_wins = await asyncio.to_thread(fetch_global_history)
-        
+
         text = tr(user_id, "history_title") + "\n\n"
-        
+
         text += tr(user_id, "history_tickets") + "\n"
         if tickets:
             for t in tickets:
-                numbers_list = ", ".join(map(str, json.loads(t['numbers_json'])))
-                text += tr(user_id, "history_ticket_line", order_id=t['order_id'], numbers=numbers_list, total=t['total'], date=t['created_at'][:19]) + "\n"
+                numbers_list = ", ".join(map(str, json.loads(t["numbers_json"])))
+                text += tr(user_id, "history_ticket_line", order_id=t["order_id"], numbers=numbers_list, total=t["total"], date=t["created_at"][:19]) + "\n"
         else:
             text += tr(user_id, "history_no_tickets") + "\n"
-            
+
         text += "\n" + tr(user_id, "history_my_wins") + "\n"
         if wins:
             for w in wins:
-                text += f"[{w['round_id']}] " + tr(user_id, "history_win_line", prize=w['prize_name'], amount=w['amount'], number=w['number'], date=w['drawn_at'][:19]) + "\n"
-                text += tr(user_id, "history_winner_info", name=w.get('customer_name') or 'N/A', phone=w.get('customer_phone') or 'N/A') + "\n"
+                text += f"[{w['round_id']}] " + tr(user_id, "history_win_line", prize=w["prize_name"], amount=w["amount"], number=w["number"], date=w["drawn_at"][:19]) + "\n"
+                text += tr(user_id, "history_winner_info", name=w.get("customer_name") or "N/A", phone=w.get("customer_phone") or "N/A") + "\n"
         else:
             text += tr(user_id, "history_no_wins") + "\n"
-            
+
         text += "\n" + tr(user_id, "history_global_wins") + "\n"
         if global_wins:
             for w in global_wins:
-                text += f"[{w['round_id']}] " + tr(user_id, "history_win_line", prize=w['prize_name'], amount=w['amount'], number=w['number'], date=w['drawn_at'][:19]) + "\n"
-                text += tr(user_id, "history_winner_info", name=w.get('customer_name') or 'N/A', phone=w.get('customer_phone') or 'N/A') + "\n"
+                text += f"[{w['round_id']}] " + tr(user_id, "history_win_line", prize=w["prize_name"], amount=w["amount"], number=w["number"], date=w["drawn_at"][:19]) + "\n"
+                text += tr(user_id, "history_winner_info", name=w.get("customer_name") or "N/A", phone=w.get("customer_phone") or "N/A") + "\n"
         else:
             text += tr(user_id, "history_no_global_wins") + "\n"
-            
+
         if hasattr(message, "edit_text"):
             await message.edit_text(text, reply_markup=back_keyboard(user_id), parse_mode="Markdown")
         else:
@@ -1613,6 +1677,7 @@ async def show_history(message, user_id):
     except Exception as e:
         logger.error(f"Error in show_history: {e}")
         await message.reply_text("⚠️ Error loading history. Please try again.")
+
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1622,6 +1687,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"History command error: {e}")
         await update.message.reply_text("⚠️ Error loading history. Please try again.")
+
 
 # ---------------------------------------------------------------------------
 # TELEGRAM HANDLERS
@@ -1636,6 +1702,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tr(user_id, "welcome", round_id=round_id), reply_markup=main_menu_keyboard(user_id)
     )
 
+
 async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await asyncio.to_thread(ensure_user, user_id)
@@ -1643,14 +1710,16 @@ async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tr(user_id, "choose_language"), reply_markup=language_keyboard()
     )
 
+
 async def board_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(ensure_user, update.effective_user.id)
     await show_board_message(update.effective_message, update.effective_user.id, context)
 
+
 async def show_board_message(message, user_id, context=None):
     counts, _, sold_customers = await asyncio.to_thread(
         get_cached_board_data, context, 1, TOTAL_NUMBERS
-    ) if context else (lambda: (get_number_counts(), {}, []))() 
+    ) if context else (lambda: (get_number_counts(), {}, []))()
     if not context:
         counts = get_number_counts()
         with db() as conn:
@@ -1669,12 +1738,12 @@ async def show_board_message(message, user_id, context=None):
                 sold_customers.append({
                     "customer_name": sc["customer_name"],
                     "customer_phone": sc["customer_phone"],
-                    "numbers": sorted(valid_nums)
+                    "numbers": sorted(valid_nums),
                 })
     if sold_customers:
         customer_lines = []
         for c in sold_customers:
-            nums_str = ", ".join(map(str, c['numbers']))
+            nums_str = ", ".join(map(str, c["numbers"]))
             customer_lines.append(f"{c['customer_name']}    {c['customer_phone']}    {nums_str}")
         customer_list_str = "\n".join(customer_lines)
     else:
@@ -1690,9 +1759,11 @@ async def show_board_message(message, user_id, context=None):
         reply_markup=back_keyboard(user_id),
     )
 
+
 async def draw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(ensure_user, update.effective_user.id)
     await show_draw_info(update.effective_message, update.effective_user.id)
+
 
 async def show_draw_info(message, user_id):
     draw_at = await asyncio.to_thread(get_draw_time)
@@ -1721,9 +1792,11 @@ async def show_draw_info(message, user_id):
         reply_markup=back_keyboard(user_id),
     )
 
+
 def fetch_draw_results():
     with db() as conn:
         return conn.execute("SELECT * FROM draw_results ORDER BY prize_rank").fetchall()
+
 
 async def send_draw_results(message, user_id):
     rows = await asyncio.to_thread(fetch_draw_results)
@@ -1740,12 +1813,14 @@ async def send_draw_results(message, user_id):
         reply_markup=back_keyboard(user_id),
     )
 
+
 async def _callback_notice(query, text):
     try:
         if query.message:
             await query.message.reply_text(text)
     except TelegramError:
         logger.debug("Could not send callback notice: %s", text, exc_info=True)
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1795,7 +1870,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sold_customers:
             customer_lines = []
             for c in sold_customers:
-                nums_str = ", ".join(map(str, c['numbers']))
+                nums_str = ", ".join(map(str, c["numbers"]))
                 customer_lines.append(f"{c['customer_name']}    {c['customer_phone']}    {nums_str}")
             customer_list_str = "\n".join(customer_lines)
         else:
@@ -1814,7 +1889,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "rules":
         await query.edit_message_text(
             tr(user_id, "rules_text", price=PRICE_PER_NUMBER, minutes=TRANSACTION_MINUTES, delay=DRAW_DELAY_MINUTES),
-            reply_markup=back_keyboard(user_id)
+            reply_markup=back_keyboard(user_id),
         )
         return
     if data == "language":
@@ -1927,6 +2002,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reject_payment_callback(update, context)
         return
 
+
 async def handle_customer_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await asyncio.to_thread(ensure_user, user_id)
@@ -1981,6 +2057,7 @@ async def handle_customer_text(update: Update, context: ContextTypes.DEFAULT_TYP
         tr(user_id, "main_menu", round_id=round_id), reply_markup=main_menu_keyboard(user_id)
     )
 
+
 async def handle_payment_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await asyncio.to_thread(ensure_user, user_id)
@@ -2030,6 +2107,7 @@ async def handle_payment_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception:
             logger.exception("Also failed to notify host about the screenshot failure")
 
+
 async def _set_support_decision_state(query, status_text):
     try:
         message = query.message
@@ -2050,6 +2128,7 @@ async def _set_support_decision_state(query, status_text):
             await query.edit_message_reply_markup(reply_markup=None)
     except TelegramError:
         logger.warning("Could not update support decision message state.", exc_info=True)
+
 
 async def approve_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2094,6 +2173,7 @@ async def approve_payment_callback(update: Update, context: ContextTypes.DEFAULT
         if counts["sold"] == TOTAL_NUMBERS:
             await broadcast_sold_out(context.application, draw_at)
 
+
 async def reject_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
@@ -2128,6 +2208,7 @@ async def reject_payment_callback(update: Update, context: ContextTypes.DEFAULT_
     except TelegramError:
         logger.exception("Could not notify customer of rejection")
 
+
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await asyncio.to_thread(cancel_user_cart, user_id)
@@ -2137,6 +2218,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         tr(user_id, "cancelled"), reply_markup=main_menu_keyboard(user_id)
     )
+
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != HOST_TELEGRAM_ID:
@@ -2159,6 +2241,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text)
 
+
 async def post_init(application: Application):
     init_db_pool()
     await asyncio.to_thread(init_db)
@@ -2168,12 +2251,14 @@ async def post_init(application: Application):
     )
     logger.info("KoshKosh database initialized with connection pool; maintenance scheduled.")
 
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(
         "Unhandled exception while processing update",
         exc_info=(type(context.error), context.error, context.error.__traceback__)
         if context.error else None,
     )
+
 
 def main():
     if not BOT_TOKEN:
@@ -2218,6 +2303,7 @@ def main():
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=False,
     )
+
 
 if __name__ == "__main__":
     main()
