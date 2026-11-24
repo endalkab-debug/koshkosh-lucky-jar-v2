@@ -9,6 +9,7 @@ import json
 import os
 import time
 import uuid
+import random
 import logging
 import requests
 from functools import wraps
@@ -243,6 +244,203 @@ def _notify_sold_out_via_api(draw_at):
             pass
 
 
+def _notify_draw_winners_via_api(round_id: str, result_rows: list[dict], participant_ids: set[int], new_round: str):
+    sorted_results = sorted(result_rows, key=lambda x: x["prize_rank"])
+    winner_user_ids = {row["winner_user_id"] for row in sorted_results}
+
+    channel_lines = ["🏆 **KOSHKOSH LUCKY JAR DRAW RESULTS**", f"Round: **{round_id}**", ""]
+    host_lines = []
+    for row in sorted_results:
+        rank = row["prize_rank"]
+        rank_emoji = "🥇" if rank == 1 else ("🥈" if rank == 2 else "🥉")
+        channel_lines.append(
+            f"{rank_emoji} **{row['prize_name']}** — **{row['amount']:,} ETB**\n"
+            f"Winning Number: **{row['number']}** | {row['customer_name']} ({row['customer_phone']})"
+        )
+        host_lines.append(
+            f"{row['prize_name']} ({row['amount']:,} ETB)\n"
+            f"Number: {row['number']}\n"
+            f"Winner Name: {row['customer_name']}\n"
+            f"Phone: {row['customer_phone']}"
+        )
+
+    try:
+        _telegram_api("sendMessage", data={
+            "chat_id": legacy.SUPPORT_CHANNEL,
+            "text": "\n".join(channel_lines),
+            "parse_mode": "Markdown",
+        })
+    except Exception:
+        logger.exception("Could not post draw results to support channel")
+
+    try:
+        host_msg = legacy.LANGUAGES["en"]["host_payout_list"].format(winner_details="\n\n".join(host_lines))
+        _telegram_api("sendMessage", data={"chat_id": legacy.HOST_TELEGRAM_ID, "text": host_msg})
+    except Exception:
+        logger.exception("Could not notify host of payout list")
+
+    for row in sorted_results:
+        rank = row["prize_rank"]
+        rank_emoji = "🥇" if rank == 1 else ("🥈" if rank == 2 else "🥉")
+        uid = row["winner_user_id"]
+        lang = legacy.get_language(uid)
+        labels = legacy.LANGUAGES.get(lang, legacy.LANGUAGES["en"])
+        p_text = labels["winner_private_msg"].format(
+            rank_emoji=rank_emoji,
+            prize_name=row["prize_name"],
+            amount=row["amount"],
+            final_number=row["number"],
+            customer_name=row["customer_name"],
+            customer_phone=row["customer_phone"],
+        )
+        try:
+            _telegram_api("sendMessage", data={"chat_id": uid, "text": p_text, "parse_mode": "Markdown"})
+        except Exception:
+            pass
+
+    final_en = "\n\n".join([f"{r['prize_name']} — {r['amount']:,} ETB | Number {r['number']}" for r in sorted_results])
+    final_am = "\n\n".join([f"{r['prize_name']} — {r['amount']:,} ብር | ቁጥር {r['number']}" for r in sorted_results])
+    next_round_am = (
+        f"🔄 {new_round} ዙር ተጀመረ! የዕጣ ቁጥሮች አሁን ለአዲስ የዕጣ ዙር ጨዋታ ዝግጁ ናቸው። "
+        f"ለ {new_round} የዕጣ ጨዋታ የዕድል ቁጥርዎትን አሁኑኑ ይምረጡ!"
+    )
+    for uid in participant_ids:
+        if uid in winner_user_ids:
+            continue
+        lang = legacy.get_language(uid)
+        res_text = ("🏆 KOSHKOSH LUCKY JAR DRAW RESULTS\n\n" + final_en) if lang == "en" else ("🏆 የኮሽኮሽ ሎተሪ የዕጣ ውጤቶች\n\n" + final_am)
+        try:
+            _telegram_api("sendMessage", data={"chat_id": uid, "text": res_text})
+            _telegram_api("sendMessage", data={"chat_id": uid, "text": next_round_am})
+        except Exception:
+            pass
+
+
+def _execute_miniapp_draw(force_if_sold_out: bool = False):
+    with legacy.db() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(7410920261109)")
+        settings_rows = conn.execute(
+            "SELECT key, value FROM app_settings WHERE key IN ('draw_at','draw_completed')"
+        ).fetchall()
+        values = {row["key"]: row["value"] for row in settings_rows}
+        draw_at = legacy.from_iso(values.get("draw_at"))
+        already_completed = values.get("draw_completed") == "1"
+
+        sold = conn.execute(
+            "SELECT number, user_id FROM numbers WHERE status='sold' ORDER BY number"
+        ).fetchall()
+        if len(sold) != legacy.TOTAL_NUMBERS:
+            return {"status": "not_ready", "reason": "All numbers are not sold yet."}
+
+        now = legacy.utc_now()
+        if not draw_at:
+            if not force_if_sold_out:
+                return {"status": "not_scheduled", "reason": "Draw has not been scheduled yet."}
+            draw_at = now
+        elif draw_at > now and not force_if_sold_out:
+            return {
+                "status": "pending",
+                "seconds_remaining": int((draw_at - now).total_seconds()),
+                "draw_at": legacy.to_iso(draw_at),
+            }
+
+        if already_completed:
+            latest = conn.execute(
+                "SELECT prize_rank, round_id, prize_name, amount, number, drawn_at "
+                "FROM draw_results ORDER BY prize_rank"
+            ).fetchall()
+            return {"status": "already_completed", "results": [dict(r) for r in latest]}
+
+        approved_orders = conn.execute(
+            "SELECT user_id, customer_name, customer_phone, numbers_json "
+            "FROM orders WHERE status='approved' ORDER BY created_at DESC"
+        ).fetchall()
+
+        number_owner_map = {}
+        participant_ids = set()
+        for ord_row in approved_orders:
+            try:
+                nums = json.loads(ord_row["numbers_json"])
+            except Exception:
+                nums = []
+            for n in nums:
+                if n not in number_owner_map:
+                    number_owner_map[n] = {
+                        "user_id": ord_row["user_id"],
+                        "customer_name": ord_row["customer_name"],
+                        "customer_phone": ord_row["customer_phone"],
+                    }
+                    participant_ids.add(ord_row["user_id"])
+
+        for s in sold:
+            if s["user_id"]:
+                participant_ids.add(s["user_id"])
+                if s["number"] not in number_owner_map:
+                    number_owner_map[s["number"]] = {
+                        "user_id": s["user_id"],
+                        "customer_name": "Player",
+                        "customer_phone": "N/A",
+                    }
+        if not participant_ids:
+            participant_ids.add(legacy.HOST_TELEGRAM_ID)
+
+        prize_count = min(len(legacy.PRIZES), len(sold))
+        winners = random.SystemRandom().sample(list(sold), prize_count)
+        drawn_iso = legacy.to_iso(now)
+        current_round = legacy.get_current_round()
+
+        result_rows = []
+        for rank, (prize_name, amount) in enumerate(legacy.PRIZES[:prize_count], start=1):
+            winner = winners[rank - 1]
+            win_num = winner["number"]
+            owner_info = number_owner_map.get(win_num) or {
+                "user_id": winner["user_id"] or legacy.HOST_TELEGRAM_ID,
+                "customer_name": "Player",
+                "customer_phone": "N/A",
+            }
+            winner_uid = owner_info["user_id"]
+            conn.execute(
+                "INSERT INTO draw_results(prize_rank, round_id, prize_name, amount, number, winner_user_id, drawn_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(prize_rank) DO UPDATE SET "
+                "round_id=EXCLUDED.round_id, prize_name=EXCLUDED.prize_name, amount=EXCLUDED.amount, "
+                "number=EXCLUDED.number, winner_user_id=EXCLUDED.winner_user_id, drawn_at=EXCLUDED.drawn_at",
+                (rank, current_round, prize_name, amount, win_num, winner_uid, drawn_iso),
+            )
+            result_rows.append({
+                "prize_rank": rank,
+                "round_id": current_round,
+                "prize_name": prize_name,
+                "amount": amount,
+                "number": win_num,
+                "winner_user_id": winner_uid,
+                "customer_name": owner_info["customer_name"],
+                "customer_phone": owner_info["customer_phone"],
+                "drawn_at": drawn_iso,
+            })
+
+        conn.execute("UPDATE numbers SET status='available',user_id=NULL,cart_token=NULL,expires_at=NULL")
+        conn.execute("DELETE FROM carts")
+        conn.execute("UPDATE app_settings SET value=NULL WHERE key='draw_at'")
+        conn.execute("UPDATE app_settings SET value='0' WHERE key='draw_completed'")
+        conn.execute("UPDATE app_settings SET value='0' WHERE key='warning_sent_5min'")
+        conn.execute("UPDATE app_settings SET value='0' WHERE key='warning_live_sent'")
+        conn.execute("UPDATE app_settings SET value=%s WHERE key='wheel_round_id'", (current_round,))
+        conn.execute("UPDATE app_settings SET value='complete' WHERE key='wheel_status'")
+        conn.execute("UPDATE app_settings SET value=%s WHERE key='wheel_active_rank'", (str(prize_count),))
+        conn.execute("UPDATE app_settings SET value=%s WHERE key='wheel_reveal_count'", (str(prize_count),))
+        conn.execute("UPDATE game_state SET round_number=round_number+1 WHERE id=1")
+        next_row = conn.execute("SELECT round_number FROM game_state WHERE id=1").fetchone()
+        new_round = f"KLR-{next_row['round_number']:05d}"
+
+    return {
+        "status": "drawn",
+        "round_id": current_round,
+        "new_round_id": new_round,
+        "results": result_rows,
+        "participant_ids": participant_ids,
+    }
+
+
 def _cart_payload(user_id: int) -> dict | None:
     cart = legacy.get_cart(user_id)
     if not cart:
@@ -365,6 +563,37 @@ def draw_state():
         "round_id": legacy.get_current_round(),
         "counts": counts,
         "draw": draw_info,
+    })
+
+
+@miniapp_api.post("/draw/run")
+@require_telegram_user
+def run_draw_now():
+    user_id = request.telegram_user["user_id"]
+    payload = request.get_json(silent=True) or {}
+    force_now = bool(payload.get("force_now")) and (user_id == legacy.HOST_TELEGRAM_ID)
+
+    legacy.release_expired_reservations()
+    outcome = _execute_miniapp_draw(force_if_sold_out=force_now)
+
+    if outcome["status"] == "drawn":
+        try:
+            _notify_draw_winners_via_api(
+                outcome["round_id"],
+                outcome["results"],
+                outcome["participant_ids"],
+                outcome["new_round_id"],
+            )
+        except Exception:
+            logger.exception("Draw succeeded in DB but Telegram notifications partially failed")
+
+    return jsonify({
+        "outcome": outcome.get("status"),
+        "reason": outcome.get("reason"),
+        "round_id": legacy.get_current_round(),
+        "counts": legacy.get_number_counts(),
+        "draw": _draw_payload(),
+        "results": outcome.get("results") or [],
     })
 
 
