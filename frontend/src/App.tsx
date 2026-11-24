@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { Trophy, Ticket, History, ShieldCheck, RefreshCw, X, Sparkles, Clock, Disc } from "lucide-react";
 
@@ -52,6 +52,12 @@ export default function App() {
   const [receiptSubmitted, setReceiptSubmitted] = useState(false);
   const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null);
 
+  const [isSpinningDraw, setIsSpinningDraw] = useState(false);
+  const [spinningNumber, setSpinningNumber] = useState<number | null>(null);
+  const [revealedWinners, setRevealedWinners] = useState<any[]>([]);
+  const [drawnRoundLabel, setDrawnRoundLabel] = useState<string | null>(null);
+  const autoDrawTriggeredForRef = useRef<string | null>(null);
+
   const load = useCallback(async () => {
     setError("");
     try {
@@ -98,41 +104,81 @@ export default function App() {
   const isSoldOut = Boolean(counts && Number(counts.sold) >= Number(totalNumbers));
   const drawAt = data?.game?.draw_at || data?.draw?.draw_at || null;
   const drawAtEthiopia = data?.game?.draw_at_ethiopia || data?.draw?.draw_at_ethiopia || null;
-  const wheel = data?.draw?.wheel || null;
-  const wheelActive = wheel && (wheel.status === "spinning" || wheel.status === "complete");
   const drawDue = Boolean(drawAt && remainingSeconds !== null && remainingSeconds <= 0);
-  const inDrawPhase = isSoldOut || Boolean(drawAt) || Boolean(wheelActive);
+  const inDrawPhase = isSoldOut || Boolean(drawAt) || isSpinningDraw || revealedWinners.length > 0;
+
+  const runMiniAppDraw = useCallback(async (forceNow = false) => {
+    if (isSpinningDraw) return;
+    setIsSpinningDraw(true);
+    setError("");
+    setRevealedWinners([]);
+
+    let spinnerInterval: number | null = null;
+    try {
+      spinnerInterval = window.setInterval(() => {
+        setSpinningNumber(Math.floor(Math.random() * totalNumbers) + 1);
+      }, 80);
+
+      const response = await fetch("/api/v1/draw/run", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(window.Telegram?.WebApp?.initData
+            ? { "X-Telegram-Init-Data": window.Telegram.WebApp.initData }
+            : {}),
+        },
+        body: JSON.stringify({ force_now: forceNow }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload?.error || "Draw execution failed.");
+      }
+
+      const results: any[] = Array.isArray(payload?.results) ? payload.results : [];
+      if (payload?.outcome === "drawn" && results.length > 0) {
+        setDrawnRoundLabel(payload.round_id || data?.game?.round_id || "KLR");
+        for (let i = 0; i < results.length; i += 1) {
+          await new Promise(resolve => window.setTimeout(resolve, 900));
+          setRevealedWinners(prev => [...prev, results[i]]);
+          window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred("success");
+        }
+        await load();
+        setNotice("Draw complete! Winners have been selected and the next round is open.");
+      } else if (payload?.outcome === "pending") {
+        setNotice("Draw timer is still counting down.");
+      } else {
+        await load();
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not run the draw.");
+    } finally {
+      if (spinnerInterval !== null) window.clearInterval(spinnerInterval);
+      setSpinningNumber(null);
+      setIsSpinningDraw(false);
+    }
+  }, [data?.game?.round_id, isSpinningDraw, load, totalNumbers]);
 
   useEffect(() => {
-    if (!inDrawPhase) return;
+    if (!drawDue || isSpinningDraw) return;
+    const key = `${data?.game?.round_id || ""}:${drawAt || ""}`;
+    if (autoDrawTriggeredForRef.current === key) return;
+    autoDrawTriggeredForRef.current = key;
+    void runMiniAppDraw(false);
+  }, [data?.game?.round_id, drawAt, drawDue, isSpinningDraw, runMiniAppDraw]);
+
+  useEffect(() => {
+    if (!inDrawPhase || isSpinningDraw) return;
     const poller = window.setInterval(() => {
       void load();
     }, 4000);
     return () => window.clearInterval(poller);
-  }, [inDrawPhase, load]);
+  }, [inDrawPhase, isSpinningDraw, load]);
 
   const selected = useMemo(() => new Set<number>(cart?.numbers || []), [cart]);
   const total = (cart?.numbers?.length || 0) * (data?.game?.price_per_number || 0);
   const lang = data?.user?.language || "en";
+  const isAdmin = Boolean(data?.user?.is_admin);
   const t = (en: string, am: string) => (lang === "am" ? am : en);
-
-  function openLiveWheel() {
-    const wheelUrl = data?.game?.wheel_url || data?.draw?.wheel_url;
-    if (!wheelUrl) {
-      setNotice(
-        t(
-          "Live wheel URL is not configured yet. Follow the draw in the bot.",
-          "የቀጥታ የዕጣ መንኮራኩር አድራሻ አልተዋቀረም። ዕጣውን በቦቱ ይከታተሉ።"
-        )
-      );
-      return;
-    }
-    if (window.Telegram?.WebApp?.openLink) {
-      window.Telegram.WebApp.openLink(wheelUrl);
-    } else {
-      window.open(wheelUrl, "_blank", "noopener,noreferrer");
-    }
-  }
 
   async function toggle(number: number) {
     setBusy(number);
@@ -267,7 +313,6 @@ export default function App() {
       </main>
     );
   }
-  const isAdmin = Boolean(data?.user?.is_admin);
 
   return (
     <main className="shell">
@@ -286,19 +331,19 @@ export default function App() {
         <div className="eyebrow">
           <Sparkles size={13} />{" "}
           {inDrawPhase
-            ? t("ROUND SOLD OUT · DRAW PHASE", "ዙር ተጠናቋል · የዕጣ ምዕራፍ")
+            ? t("ROUND SOLD OUT · MINI APP DRAW", "ዙር ተጠናቋል · የዕጣ ማውጣት")
             : t("YOUR NEXT LUCKY MOMENT", "የእድልዎ ቀጣይ ቅጽበት")}
         </div>
         <h1>
           {inDrawPhase
-            ? t("All numbers sold. Draw in progress.", "ሁሉም ቁጥሮች ተሽጠዋል። የዕጣው ምዕራፍ ላይ ነን።")
+            ? t("Mini App Lucky Draw", "የዕጣ ማውጣት በሚኒ አፕ")
             : t("Choose your lucky numbers.", "የዕድል ቁጥሮችዎን ይምረጡ።")}
         </h1>
         <p>
           {inDrawPhase
             ? t(
-                "Round sales are closed. Track the draw countdown, live wheel, and winners below.",
-                "የዚህ ዙር ሽያጭ ተጠናቋል። የዕጣውን ቆጠራ፣ የቀጥታ መንኮራኩር እና አሸናፊዎችን ከታች ይመልከቱ።"
+                "All numbers are sold. The draw runs right here in the Mini App.",
+                "ሁሉም ቁጥሮች ተሽጠዋል። ዕጣው እዚሁ ሚኒ አፕ ውስጥ ይወጣል።"
               )
             : t("One number. One chance. A jar full of possibilities.", "አንድ ቁጥር። አንድ ዕድል። በተስፋ የተሞላ ማሰሮ።")}
         </p>
@@ -324,59 +369,59 @@ export default function App() {
           <div className="section-heading">
             <div>
               <h2>
-                {wheelActive
-                  ? t("Live Lucky Wheel", "የቀጥታ የዕጣ መንኮራኩር")
-                  : t("Draw Phase", "የዕጣ ምዕራፍ")}
+                {drawnRoundLabel
+                  ? `${t("Round Results", "የዙር ውጤቶች")} (${drawnRoundLabel})`
+                  : t("Mini App Draw Machine", "የሚኒ አፕ የዕጣ ማውጫ")}
               </h2>
               <p>
                 {drawAtEthiopia
                   ? `${t("Scheduled (Ethiopia time)", "የዕጣ ሰዓት (ኢትዮጵያ)")}: ${drawAtEthiopia}`
                   : t(
-                      "All numbers are sold. Waiting for draw schedule or live draw sequence.",
-                      "ሁሉም ቁጥሮች ተሽጠዋል። የዕጣ ሰዓት ወይም የዕጣ መውጣት በመጠባበቅ ላይ።"
+                      "All numbers are sold. Ready to draw winners.",
+                      "ሁሉም ቁጥሮች ተሽጠዋል። አሸናፊዎችን ለማውጣት ዝግጁ ነው።"
                     )}
               </p>
             </div>
             <Disc className="gold" />
           </div>
 
-          {remainingSeconds !== null && !drawDue && (
+          {remainingSeconds !== null && remainingSeconds > 0 && !isSpinningDraw && (
             <p className="expires">
-              <Clock size={14} /> {t("Time remaining", "ቀሪ ጊዜ")}:{" "}
+              <Clock size={14} /> {t("Draw countdown", "የዕጣ ቆጠራ")}:{" "}
               <strong>{formatCountdown(remainingSeconds)}</strong>
             </p>
           )}
 
-          {drawDue && !wheelActive && (
-            <p className="expires">
-              {t(
-                "Draw time reached. Executing draw & advancing round…",
-                "የዕጣ ሰዓት ደርሷል። ዕጣ በማውጣት እና ወደ ቀጣይ ዙር በመሸጋገር ላይ…"
-              )}
-            </p>
-          )}
-
-          {wheelActive && (
+          {isSpinningDraw && (
             <div className="wheel-status-box">
               <p>
-                {t("Wheel status", "የመንኮራኩር ሁኔታ")}: <b>{wheel.status}</b> ·{" "}
-                {t("Revealed", "የተገለጡ")}: <b>{wheel.revealed_count}</b> / 3
+                {t("Drawing winning numbers…", "የዕድል ቁጥሮችን በማውጣት ላይ…")}{" "}
+                <b>{spinningNumber ? `#${spinningNumber}` : "…"}</b>
               </p>
-              {Array.isArray(wheel.results) && wheel.results.length > 0 && (
-                <div className="wheel-reveals">
-                  {wheel.results.map((r: any) => (
-                    <div className="history-row" key={r.prize_rank}>
-                      {r.prize_name} — <b>#{r.number}</b> ({Number(r.amount).toLocaleString()} ETB)
-                    </div>
-                  ))}
-                </div>
-              )}
             </div>
           )}
 
-          <button className="primary full" onClick={openLiveWheel}>
-            {t("Watch Live Draw", "ቀጥታ የዕጣ አወጣጥ ይመልከቱ")}
-          </button>
+          {revealedWinners.length > 0 && (
+            <div className="wheel-reveals">
+              {revealedWinners.map((w: any) => (
+                <div className="history-row" key={w.prize_rank}>
+                  {w.prize_name} — <b>#{w.number}</b> ({Number(w.amount).toLocaleString()} ETB) ·{" "}
+                  {w.customer_name}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {isSoldOut && !isSpinningDraw && (
+            <button
+              className="primary full"
+              onClick={() => void runMiniAppDraw(isAdmin)}
+            >
+              {isAdmin
+                ? t("Draw Winners Now", "አሸናፊዎችን አሁን አውጣ")
+                : t("Spin & Draw in Mini App", "በሚኒ አፕ ውስጥ ዕጣ አውጣ")}
+            </button>
+          )}
         </section>
       )}
 
